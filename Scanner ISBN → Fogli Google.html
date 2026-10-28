@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scanner ISBN → Fogli Google</title>
+<style>
+:root{--bg:#eef1ee;--ink:#17212b;--mute:#5b6770;--card:#fff;--line:#cfd7d2;--acc:#1f6f78;--acc-ink:#fff;--red:#d6334a;--ok:#2b7a4b}
+@media(prefers-color-scheme:dark){:root{--bg:#121a1f;--ink:#e8eeea;--mute:#9aa7ad;--card:#1a252c;--line:#2c3a42;--acc:#58b4bd;--acc-ink:#0b1519;--red:#ff6b80;--ok:#6fd49a}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+main{max-width:520px;margin:0 auto;padding:16px}
+h1{font:600 1.5rem/1.2 Georgia,'Iowan Old Style',serif;margin:8px 0 14px}
+.cam{position:relative;border-radius:14px;overflow:hidden;background:#000;aspect-ratio:4/3}
+video{width:100%;height:100%;object-fit:cover;display:block}
+.frame{position:absolute;inset:22% 8%;border:2px solid rgba(255,255,255,.85);border-radius:8px;pointer-events:none}
+.frame::after{content:"";position:absolute;left:4%;right:4%;top:50%;height:2px;background:var(--red);box-shadow:0 0 8px var(--red);animation:sweep 2.2s ease-in-out infinite alternate}
+@keyframes sweep{from{top:12%}to{top:88%}}
+@media(prefers-reduced-motion:reduce){.frame::after{animation:none}}
+.hint{position:absolute;left:0;right:0;bottom:8px;text-align:center;color:#fff;font-size:.85rem;text-shadow:0 1px 3px #000}
+button{font:inherit;font-weight:600;border:0;border-radius:10px;padding:12px 16px;background:var(--acc);color:var(--acc-ink);cursor:pointer}
+button.alt{background:transparent;color:var(--ink);border:1px solid var(--line)}
+button:focus-visible,input:focus-visible{outline:3px solid var(--acc);outline-offset:2px}
+.row{display:flex;gap:8px;margin:10px 0}
+.row>*{flex:1}
+input{width:100%;font:inherit;padding:11px 12px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--ink)}
+label{display:block;font-size:.85rem;color:var(--mute);margin:10px 0 3px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin-top:14px}
+.status{margin-top:10px;min-height:1.4em;font-size:.95rem}
+.status.err{color:var(--red)}.status.ok{color:var(--ok)}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:0 10px}
+details{margin-top:14px}summary{cursor:pointer;color:var(--mute)}
+ul{padding-left:18px;color:var(--mute);margin:8px 0 0}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<main>
+<h1>Scanner ISBN</h1>
+
+<div class="cam">
+  <video id="v" playsinline muted></video>
+  <div class="frame"></div>
+  <div class="hint">Inquadra il codice a barre sul retro del libro</div>
+</div>
+<div class="row">
+  <button id="start">Avvia fotocamera</button>
+  <button id="stop" class="alt" hidden>Ferma</button>
+</div>
+
+<div class="row">
+  <input id="manual" inputmode="numeric" placeholder="Oppure scrivi l'ISBN" aria-label="ISBN manuale">
+  <button id="go" class="alt" style="flex:0 0 auto">Cerca</button>
+</div>
+<div id="status" class="status" role="status"></div>
+
+<form id="form" class="card" hidden onsubmit="return false">
+  <label for="f-isbn">ISBN</label><input id="f-isbn">
+  <label for="f-autore">Autore</label><input id="f-autore">
+  <label for="f-titolo">Titolo</label><input id="f-titolo">
+  <label for="f-editore">Casa editrice</label><input id="f-editore">
+  <div class="grid">
+    <div><label for="f-anno">Anno di pubblicazione</label><input id="f-anno" inputmode="numeric"></div>
+    <div><label for="f-pagine">Pagine</label><input id="f-pagine" inputmode="numeric"></div>
+  </div>
+  <div class="row" style="margin-top:16px">
+    <button id="send">Invia a Fogli Google</button>
+    <button id="skip" class="alt">Scarta</button>
+  </div>
+</form>
+
+<details id="cfg">
+  <summary>Impostazioni</summary>
+  <label for="url">URL dell'app web di Google Apps Script</label>
+  <input id="url" placeholder="https://script.google.com/macros/s/.../exec">
+  <div class="row"><button id="save" class="alt">Salva URL</button></div>
+</details>
+
+<details>
+  <summary>Libri inviati in questa sessione</summary>
+  <ul id="log"><li>Nessuno</li></ul>
+</details>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const KEY = 'isbn_sheet_url';
+let stream = null, running = false, busy = false, zxReader = null;
+
+function say(t, cls){ const s=$('status'); s.textContent=t; s.className='status '+(cls||''); }
+
+/* ---------- ISBN ---------- */
+function ean13ok(c){ let s=0; for(let i=0;i<12;i++) s+=+c[i]*(i%2?3:1); return (10-s%10)%10===+c[12]; }
+function isbn10to13(c){ const b='978'+c.slice(0,9); let s=0; for(let i=0;i<12;i++) s+=+b[i]*(i%2?3:1); return b+((10-s%10)%10); }
+function normalize(raw){
+  const c = String(raw).replace(/[^0-9Xx]/g,'').toUpperCase();
+  if(/^97[89]\d{10}$/.test(c) && ean13ok(c)) return c;
+  if(/^\d{9}[\dX]$/.test(c)){
+    let s=0; for(let i=0;i<10;i++) s+=(c[i]==='X'?10:+c[i])*(10-i);
+    if(s%11===0) return isbn10to13(c);
+  }
+  return null;
+}
+
+/* ---------- Ricerca dati ---------- */
+async function fromGoogle(isbn){
+  const r = await fetch('https://www.googleapis.com/books/v1/volumes?q=isbn:'+isbn);
+  if(!r.ok) return {};
+  const j = await r.json();
+  const v = j.items && j.items[0] && j.items[0].volumeInfo;
+  if(!v) return {};
+  return {
+    autore:(v.authors||[]).join(', '), titolo:v.title||'', editore:v.publisher||'',
+    anno:(v.publishedDate||'').slice(0,4), pagine:v.pageCount||''
+  };
+}
+async function fromOpenLibrary(isbn){
+  const r = await fetch('https://openlibrary.org/api/books?bibkeys=ISBN:'+isbn+'&format=json&jscmd=data');
+  if(!r.ok) return {};
+  const j = await r.json();
+  const v = j['ISBN:'+isbn];
+  if(!v) return {};
+  const y = (v.publish_date||'').match(/\d{4}/);
+  return {
+    autore:(v.authors||[]).map(a=>a.name).join(', '), titolo:v.title||'',
+    editore:(v.publishers||[]).map(p=>p.name).join(', '),
+    anno:y?y[0]:'', pagine:v.number_of_pages||''
+  };
+}
+async function lookup(isbn){
+  let d = {};
+  try{ d = await fromGoogle(isbn); }catch(e){}
+  const keys = ['autore','titolo','editore','anno','pagine'];
+  if(keys.some(k=>!d[k])){
+    try{ const o = await fromOpenLibrary(isbn); keys.forEach(k=>{ if(!d[k]) d[k]=o[k]||''; }); }catch(e){}
+  }
+  return d;
+}
+
+/* ---------- Flusso ---------- */
+async function handleCode(raw){
+  if(busy) return;
+  const isbn = normalize(raw);
+  if(!isbn) return;
+  busy = true;
+  if(navigator.vibrate) navigator.vibrate(60);
+  say('ISBN '+isbn+' trovato. Cerco i dati…');
+  const d = await lookup(isbn);
+  $('f-isbn').value = isbn;
+  $('f-autore').value = d.autore||'';
+  $('f-titolo').value = d.titolo||'';
+  $('f-editore').value = d.editore||'';
+  $('f-anno').value = d.anno||'';
+  $('f-pagine').value = d.pagine||'';
+  $('form').hidden = false;
+  const found = d.titolo;
+  say(found ? 'Controlla i dati e invia.' : 'Libro non trovato online: compila i campi a mano.', found?'ok':'err');
+  $('form').scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+
+async function send(){
+  const url = localStorage.getItem(KEY);
+  if(!url){ $('cfg').open = true; say('Inserisci prima l\'URL di Google Apps Script nelle impostazioni.','err'); return; }
+  const row = {
+    isbn:$('f-isbn').value.trim(), autore:$('f-autore').value.trim(), titolo:$('f-titolo').value.trim(),
+    editore:$('f-editore').value.trim(), anno:$('f-anno').value.trim(), pagine:$('f-pagine').value.trim()
+  };
+  $('send').disabled = true;
+  try{
+    await fetch(url,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify(row)});
+    say('Inviato a Fogli Google: '+(row.titolo||row.isbn),'ok');
+    const li=document.createElement('li'); li.textContent=(row.titolo||'(senza titolo)')+' — '+row.isbn;
+    const log=$('log'); if(log.firstChild && log.firstChild.textContent==='Nessuno') log.innerHTML=''; log.prepend(li);
+    $('form').hidden = true; busy = false;
+  }catch(e){
+    say('Invio non riuscito. Controlla la connessione e l\'URL salvato.','err');
+  }
+  $('send').disabled = false;
+}
+
+/* ---------- Fotocamera ---------- */
+async function startCam(){
+  if(running) return;
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    say('Fotocamera non disponibile: apri la pagina da un indirizzo https.','err'); return;
+  }
+  try{
+    if('BarcodeDetector' in window){
+      const det = new BarcodeDetector({formats:['ean_13']});
+      stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1280}},audio:false});
+      $('v').srcObject = stream; await $('v').play(); running = true;
+      (async function loop(){
+        while(running){
+          if(!busy){ try{ const r = await det.detect($('v')); if(r.length) handleCode(r[0].rawValue); }catch(e){} }
+          await new Promise(r=>setTimeout(r,200));
+        }
+      })();
+    } else {
+      const Z = ZXing;
+      const hints = new Map([[Z.DecodeHintType.POSSIBLE_FORMATS,[Z.BarcodeFormat.EAN_13]]]);
+      zxReader = new Z.BrowserMultiFormatReader(hints);
+      running = true;
+      await zxReader.decodeFromConstraints({video:{facingMode:{ideal:'environment'}},audio:false},'v',(res)=>{ if(res && !busy) handleCode(res.getText()); });
+    }
+    $('start').hidden = true; $('stop').hidden = false;
+    say('Fotocamera attiva. Inquadra il codice a barre.');
+  }catch(e){
+    running = false;
+    say('Impossibile usare la fotocamera: consenti l\'accesso nelle impostazioni del browser.','err');
+  }
+}
+function stopCam(){
+  running = false;
+  if(zxReader){ try{ zxReader.reset(); }catch(e){} zxReader=null; }
+  if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
+  $('v').srcObject = null;
+  $('start').hidden = false; $('stop').hidden = true;
+}
+
+/* ---------- Eventi ---------- */
+$('start').onclick = startCam;
+$('stop').onclick = stopCam;
+$('go').onclick = ()=>{
+  const i = normalize($('manual').value);
+  if(!i){ say('ISBN non valido. Controlla le cifre.','err'); return; }
+  busy = false; handleCode(i); $('manual').value='';
+};
+$('send').onclick = send;
+$('skip').onclick = ()=>{ $('form').hidden = true; busy = false; say('Scartato. Puoi scansionare un altro libro.'); };
+$('save').onclick = ()=>{
+  const u = $('url').value.trim();
+  if(!/^https:\/\/script\.google\.com\/.+/.test(u)){ say('L\'URL deve iniziare con https://script.google.com/','err'); return; }
+  try{ localStorage.setItem(KEY,u); }catch(e){}
+  say('URL salvato.','ok'); $('cfg').open = false;
+};
+try{ const u = localStorage.getItem(KEY); if(u) $('url').value = u; else $('cfg').open = true; }catch(e){ $('cfg').open = true; }
+</script>
+</body>
+</html>
